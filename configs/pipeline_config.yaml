@@ -1,0 +1,67 @@
+device: mps
+
+detection:
+  # COCO fallback (person + sports ball, two-pass merge) — reverted here
+  # after A/B testing against the custom model (see below): the custom
+  # checkpoint underperformed across the board (fewer detections, MORE
+  # frames with zero detections, and worse ball recall too), most likely a
+  # data-diversity gap (its 1,484-image training set under-represents
+  # compositions like extreme close-up goalkeeper saves) rather than a
+  # "needs more epochs" problem — see conversation history for the full
+  # before/after numbers.
+  model_path: data/models/yolov8n.pt
+  confidence_threshold: 0.3
+  iou_threshold: 0.5
+  ball_confidence_threshold: 0.1
+  classes: null
+
+  # Custom model fine-tuned on the curated youtube-sourced subset (see
+  # scripts/curate_dataset.py), stopped early at epoch 39/50 — kept here
+  # commented out rather than deleted, since it's a real artifact worth
+  # revisiting if the training set grows more diverse:
+  # model_path: data/models/football_ball_player_v3_epoch39_best.pt
+  # confidence_threshold: 0.25
+  # classes: [0, 1]  # matches detection_clean/data.yaml's names: [ball, player]
+  # class_name_overrides: {0: sports ball, 1: person}
+  # singleton_class_ids: [0]  # only one ball is ever in play
+
+tracking:
+  track_activation_threshold: 0.25
+  lost_track_buffer: 30
+  minimum_matching_threshold: 0.8
+  frame_rate: 30
+
+team_classification:
+  enabled: true
+  # Wait for at least this many DISTINCT players before fitting the team
+  # clusters — fitting on only 1-2 individuals (e.g. during an opening
+  # close-up shot) teaches the classifier "person A vs person B," not
+  # "kit color A vs kit color B," and it won't generalize to new players.
+  min_distinct_tracks: 10
+  max_wait_frames: 500 # give up team classification if this diversity never appears
+  max_fit_crops: 60
+
+ball_tracking:
+  enabled: true
+  # Kalman filter bridges gaps in raw ball detection (the COCO fallback only
+  # catches the ball in ~1 in 5 frames) using recent motion. Coasts on pure
+  # prediction for up to this many consecutive missed frames before giving
+  # up (ball likely left frame, or a scene cut happened) rather than
+  # blending stale state into an unrelated future observation.
+  max_coast_frames: 15
+  process_noise: 5.0
+  measurement_noise: 10.0
+
+calibration:
+  # Path to a homography saved by scripts/calibrate_pitch.py. Leave null to
+  # skip calibration entirely — position log will still work, just in pixel
+  # space (pitch_x/pitch_y columns stay empty), so heatmaps/tactical metrics
+  # (which need real-world meters) won't be available, but the passing
+  # network and annotated video still work fine on pixel coordinates.
+  homography_path: null
+
+paths:
+  raw_video: data/raw_videos/sample.webm
+  output_video: outputs/annotated_videos/sample_annotated_balltrack.mp4
+  position_log: outputs/position_log_balltrack.csv
+  models_dir: data/models

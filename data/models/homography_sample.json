@@ -1,0 +1,72 @@
+{
+  "video": "data/raw_videos/Sample3.mp4",
+  "frame": 0,
+  "correspondences": [
+    {
+      "pixel": [
+        1362,
+        70
+      ],
+      "pitch": [
+        105.0,
+        0.0
+      ],
+      "name": "corner_top_right"
+    },
+    {
+      "pixel": [
+        339,
+        331
+      ],
+      "pitch": [
+        52.5,
+        24.85
+      ],
+      "name": "center_circle_top"
+    },
+    {
+      "pixel": [
+        359,
+        523
+      ],
+      "pitch": [
+        52.5,
+        43.15
+      ],
+      "name": "center_circle_bottom"
+    },
+    {
+      "pixel": [
+        65,
+        449
+      ],
+      "pitch": [
+        43.35,
+        34.0
+      ],
+      "name": "center_circle_left"
+    },
+    {
+      "pixel": [
+        611,
+        391
+      ],
+      "pitch": [
+        61.65,
+        34.0
+      ],
+      "name": "center_circle_right"
+    },
+    {
+      "pixel": [
+        1435,
+        307
+      ],
+      "pitch": [
+        94.0,
+        34.0
+      ],
+      "name": "right_penalty_spot"
+    }
+  ]
+}

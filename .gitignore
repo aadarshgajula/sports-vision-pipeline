@@ -1,0 +1,45 @@
+# --- Python ---
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# --- OS / editor ---
+.DS_Store
+.vscode/
+.idea/
+
+# --- Large / regeneratable data (see README for how to get each of these) ---
+
+# User-supplied source footage (tens to hundreds of MB each)
+data/raw_videos/*
+!data/raw_videos/.gitkeep
+
+# Downloaded/curated training datasets (multiple GB) — see
+# scripts/download_dataset.py + scripts/curate_dataset.py
+data/datasets/*
+!data/datasets/.gitkeep
+
+# Trained model checkpoints (6-25MB each) — see scripts/train_detector.py
+data/models/*.pt
+!data/models/.gitkeep
+
+# Local web app per-job runtime output (webapp/jobs.py) — ephemeral by design
+data/webapp_jobs/*
+!data/webapp_jobs/.gitkeep
+
+# Ultralytics training-run artifacts (checkpoints, plots, logs)
+runs/
+
+# Pipeline/analytics run logs
+*.log
+
+# Generated videos (hundreds of MB each) and position-log CSVs — regenerate
+# via src/pipeline.py. Small PNG outputs (heatmaps, passing network,
+# formation diagrams) are intentionally kept as committed example results.
+outputs/**/*.mp4
+outputs/*.csv
+outputs/**/*.csv

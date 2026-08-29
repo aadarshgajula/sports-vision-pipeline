@@ -1,0 +1,90 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Sports Vision Pipeline</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<h1>Sports Vision Pipeline</h1>
+<div class="subtitle">Tactical-cam footage in — annotated video, 2D top-down view, heatmaps, and passing network out.</div>
+
+<div id="screen-upload" class="screen active">
+  <div class="card">
+    <h3>1. Upload a video</h3>
+    <p style="color:#8a949e; font-size:13px;">Wide, fixed tactical-camera footage works best (this is what the model was trained on).</p>
+    <input type="file" id="file-input" accept="video/*">
+    <div style="margin-top:12px;"><button id="upload-btn">Upload</button></div>
+    <div id="upload-status" style="margin-top:10px; color:#8a949e; font-size:13px;"></div>
+  </div>
+</div>
+
+<div id="screen-calibrate" class="screen">
+  <div class="card">
+    <h3>2. Calibrate this camera angle (one-time per video)</h3>
+    <p style="color:#8a949e; font-size:13px;">
+      Pick the keypoint you're about to mark from the dropdown, then click that landmark on the frame below.
+      Add at least 4 points spread across the frame — more, and more spread out, gives a more accurate result.
+    </p>
+    <input type="range" id="frame-slider" min="0" max="0" value="0">
+    <div class="row">
+      <select id="keypoint-select"></select>
+      <span id="frame-label" style="color:#8a949e; font-size:13px;"></span>
+    </div>
+    <canvas id="calibrate-canvas"></canvas>
+  </div>
+  <div class="card">
+    <h4 style="margin-top:0;">Points added (<span id="point-count">0</span>)</h4>
+    <div class="point-list" id="point-list"></div>
+    <div class="row" style="margin-top:14px;">
+      <button id="save-calibration-btn" disabled>Save Calibration & Run Analysis</button>
+      <span id="calibration-feedback" style="font-size:13px;"></span>
+    </div>
+  </div>
+</div>
+
+<div id="screen-processing" class="screen">
+  <div class="card">
+    <h3>3. Processing</h3>
+    <div class="stage-label" id="stage-label">Starting…</div>
+    <div class="progress-bar-track"><div class="progress-bar-fill" id="progress-fill" style="width:0%"></div></div>
+    <p style="color:#8a949e; font-size:13px; margin-top:14px;">This runs detection, tracking, team classification, ball tracking, and analytics — typically a few minutes depending on video length.</p>
+  </div>
+</div>
+
+<div id="screen-results" class="screen">
+  <div class="card">
+    <h3>Results</h3>
+    <div id="warnings-container"></div>
+    <div id="quality-ok" class="quality-ok"></div>
+  </div>
+  <div class="results-grid">
+    <div class="full">
+      <h4>Annotated video</h4>
+      <video controls id="video-annotated"></video>
+    </div>
+    <div class="full">
+      <h4>2D top-down view</h4>
+      <video controls id="video-topdown"></video>
+    </div>
+    <div>
+      <h4>Team 0 heatmap</h4>
+      <img id="img-heatmap-0">
+    </div>
+    <div>
+      <h4>Team 1 heatmap</h4>
+      <img id="img-heatmap-1">
+    </div>
+    <div class="full">
+      <h4>Passing network</h4>
+      <img id="img-passing">
+    </div>
+  </div>
+  <div class="card" style="margin-top:16px;">
+    <button class="secondary" id="new-video-btn">Analyze another video</button>
+  </div>
+</div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
