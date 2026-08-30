@@ -189,6 +189,13 @@ function showResults(data) {
   document.getElementById("img-heatmap-0").src = `/api/jobs/${jobId}/files/${data.results.heatmap_team_0}`;
   document.getElementById("img-heatmap-1").src = `/api/jobs/${jobId}/files/${data.results.heatmap_team_1}`;
   document.getElementById("img-passing").src = `/api/jobs/${jobId}/files/${data.results.passing_network}`;
+  document.getElementById("img-formation-0").src = `/api/jobs/${jobId}/files/${data.results.formation_team_0}`;
+  document.getElementById("img-formation-1").src = `/api/jobs/${jobId}/files/${data.results.formation_team_1}`;
+
+  (data.formations || []).forEach(f => {
+    const el = document.getElementById(`formation-label-${f.team}`);
+    if (el) el.textContent = `${f.label} (confidence: ${f.confidence})`;
+  });
 
   const warningsContainer = document.getElementById("warnings-container");
   warningsContainer.innerHTML = "";

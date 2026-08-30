@@ -16,7 +16,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from src.analytics import heatmaps, passing_network, tactical_metrics
+from src.analytics import formation, heatmaps, passing_network, tactical_metrics
 from src.analytics.passing_network import DEFAULT_PIXEL_RADIUS_SCALE
 from src.utils.position_log import load_csv
 
@@ -26,6 +26,7 @@ def main():
     parser.add_argument("--position-log", default="outputs/position_log.csv")
     parser.add_argument("--heatmaps-dir", default="outputs/heatmaps")
     parser.add_argument("--passing-graphs-dir", default="outputs/passing_graphs")
+    parser.add_argument("--formations-dir", default="outputs/formations")
     parser.add_argument("--possession-radius", type=float, default=3.0,
                          help="Possession radius in meters — only used if calibrated (pitch coordinates present)")
     parser.add_argument("--radius-scale", type=float, default=DEFAULT_PIXEL_RADIUS_SCALE,
@@ -56,6 +57,21 @@ def main():
             print(width_depth.groupby("team")[["width_m", "depth_m"]].mean())
         if not avg_dist.empty:
             print(avg_dist.groupby("team")["avg_distance_m"].mean())
+
+        print("\nFormation recognition (whole-clip average position, heuristic — see caveats):")
+        for team in sorted(df["team"].dropna().unique()):
+            team = int(team)
+            try:
+                result = formation.detect_formation(df, team=team)
+            except ValueError as e:
+                print(f"  Skipped team {team} formation: {e}")
+                continue
+            print(f"  Team {team}: {result.formation_label} (confidence={result.confidence})")
+            for c in result.caveats:
+                print(f"    caveat: {c}")
+            out_path = f"{args.formations_dir}/team_{team}_formation.png"
+            formation.draw_formation(result, out_path, title=f"Team {team}: {result.formation_label}")
+            print(f"    Wrote {out_path}")
     else:
         print("No pitch coordinates in position log (no homography was loaded during the "
               "pipeline run) — skipping heatmaps and tactical metrics. "

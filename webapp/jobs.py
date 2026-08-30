@@ -28,7 +28,7 @@ ROOT = Path(__file__).resolve().parent.parent
 JOBS_DIR = ROOT / "data" / "webapp_jobs"
 JOBS_DIR.mkdir(parents=True, exist_ok=True)
 
-DFL_MODEL_PATH = "data/models/dfl_ball_player_ref_v1_best.pt"
+DFL_MODEL_PATH = "data/models/dfl_ball_player_ref_v3_best.pt"
 
 # Quality-check thresholds — the automated replacement for a human (or an AI
 # assistant) eyeballing the output. See README/conversation history: both of
@@ -76,6 +76,7 @@ def create_job(video_bytes: bytes, filename: str) -> dict:
         "calibration_quality": None,
         "results": None,
         "warnings": [],
+        "formations": [],
     }
     return JOBS[job_id]
 
@@ -244,6 +245,35 @@ def _run_quality_checks(job: dict):
     job["warnings"] = warnings
 
 
+_FORMATION_LINE_RE = re.compile(r"^\s*Team (\d+): (.+?) \(confidence=(\w+)\)")
+_CAVEAT_LINE_RE = re.compile(r"^\s*caveat: (.+)$")
+
+
+def _parse_formation_summary(log_path: Path) -> list[dict]:
+    """Reads generate_analytics.py's printed formation summary back out of
+    its log, so the UI can show the label/confidence/caveats as text next
+    to the diagram image rather than making a viewer read tiny text baked
+    into the PNG."""
+    if not log_path.exists():
+        return []
+    formations = []
+    current = None
+    for line in log_path.read_text().splitlines():
+        match = _FORMATION_LINE_RE.match(line)
+        if match:
+            if current:
+                formations.append(current)
+            current = {"team": int(match.group(1)), "label": match.group(2),
+                       "confidence": match.group(3), "caveats": []}
+            continue
+        caveat_match = _CAVEAT_LINE_RE.match(line)
+        if caveat_match and current:
+            current["caveats"].append(caveat_match.group(1))
+    if current:
+        formations.append(current)
+    return formations
+
+
 def _run_job_thread(job_id: str):
     job = JOBS[job_id]
     try:
@@ -262,13 +292,17 @@ def _run_job_thread(job_id: str):
         job["progress"] = 0.7
         heatmaps_dir = Path(job["dir"]) / "heatmaps"
         passing_dir = Path(job["dir"]) / "passing_graphs"
+        formations_dir = Path(job["dir"]) / "formations"
+        analytics_log = Path(job["dir"]) / "analytics.log"
         _run_subprocess(
             [_python(), "scripts/generate_analytics.py",
              "--position-log", str(Path(job["dir"]) / "position_log.csv"),
              "--heatmaps-dir", str(heatmaps_dir),
-             "--passing-graphs-dir", str(passing_dir)],
-            Path(job["dir"]) / "analytics.log",
+             "--passing-graphs-dir", str(passing_dir),
+             "--formations-dir", str(formations_dir)],
+            analytics_log,
         )
+        job["formations"] = _parse_formation_summary(analytics_log)
 
         job["stage"] = "rendering_topdown"
         job["progress"] = 0.85
@@ -289,6 +323,8 @@ def _run_job_thread(job_id: str):
             "heatmap_team_0": "heatmaps/team_0_heatmap.png",
             "heatmap_team_1": "heatmaps/team_1_heatmap.png",
             "passing_network": "passing_graphs/passing_network.png",
+            "formation_team_0": "formations/team_0_formation.png",
+            "formation_team_1": "formations/team_1_formation.png",
         }
         job["stage"] = "done"
         job["progress"] = 1.0

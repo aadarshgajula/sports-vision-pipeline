@@ -101,6 +101,7 @@ def job_status(job_id: str):
         "warnings": job["warnings"],
         "results": job["results"],
         "calibration_quality": job["calibration_quality"],
+        "formations": job.get("formations", []),
     }
 
 
