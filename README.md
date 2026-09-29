@@ -54,7 +54,7 @@ matching the calibrated angle will project correctly.
 | Detection | `src/detection/detector.py` |
 | Tracking | `src/tracking/tracker.py` (ByteTrack) |
 | Ball tracking (bridges detection gaps) | `src/tracking/ball_tracker.py` (Kalman filter) |
-| Team classification | `src/team_classification/classifier.py` (SigLIP embeddings → UMAP → KMeans) |
+| Team classification | `src/team_classification/classifier.py` (nearest-anchor jersey color match) |
 | Calibration | `src/calibration/homography.py`, `scripts/calibrate_pitch.py` |
 | Analytics | `src/analytics/` — `heatmaps.py`, `passing_network.py`, `tactical_metrics.py` |
 | 2D top-down view | `scripts/render_topdown_view.py` |
@@ -91,24 +91,32 @@ Stated plainly rather than glossed over — these are real, found by testing
 against actual match footage during development, not hypothetical edge
 cases:
 
-- **Ball tracking still has visible continuity problems.** The Kalman
-  filter (`src/tracking/ball_tracker.py`) bridges short gaps well, but in
-  the 2D top-down view the ball can still appear to flash/jump — it hard-
-  disappears when tracking is lost for too long, then snaps (rather than
-  glides) to the next real detection. This is a known, currently unresolved
-  issue, not something to trust as smooth ground truth yet.
-- **Team classification can fail on short clips.** It's a 2-cluster
-  kit-color split (SigLIP + KMeans) that needs to see enough distinct
-  players before it fits — on a clip that's too short or dominated early on
-  by just 1-2 players, it can collapse both teams into one cluster. The web
-  app's automated quality check flags this (a lopsided team split warning)
-  when it happens, rather than silently shipping a wrong result.
-- **No dedicated goalkeeper class on the COCO fallback path** — a
-  goalkeeper's distinct kit color gets pulled into whichever team cluster
-  is closer, not handled as an outlier. The custom tactical-cam model does
-  have a separate `ref` class (correctly excluded from both teams), but
-  still has no `goalkeeper` class, which matters for anything describing
-  outfield-only shape (e.g. a future formation-recognition feature).
+- **Ball tracking has two layers of gap-bridging, still not gap-free.** The
+  online Kalman filter (`src/tracking/ball_tracker.py`) coasts through
+  short gaps during the pipeline run; a second offline pass
+  (`src/utils/ball_track_cleaning.py`) interpolates further gaps in the
+  completed position log, shared by both the 2D top-down view and the
+  passing network, with implausible off-pitch positions rejected before
+  they can anchor an interpolation. Gaps longer than both layers' limits —
+  a real, extended loss (ball left frame, scene cut) — still show as a
+  genuine cut rather than an invented trajectory, which is deliberate, not
+  a bug.
+- **Team classification requires one manual step: an example crop per
+  team.** After unsupervised color clustering (SigLIP+KMeans, then several
+  hand-engineered color-feature attempts) kept breaking on a new kit
+  combination every time one failure mode was patched, it was replaced with
+  nearest-anchor matching — the user clicks one example player per team
+  (and optionally the referee) during the same one-time calibration step
+  already required for pitch homography, and classification becomes
+  distance-to-that-example rather than guessed cluster structure. More
+  reliable, but it means team classification is only as good as the anchor
+  crops picked — a blurry or occluded click will teach it the wrong color.
+- **No dedicated goalkeeper anchor** — a goalkeeper's distinct kit color
+  gets matched to whichever anchor (team or referee) is closest, since the
+  calibration step only asks for one example per team plus the referee.
+  Matters for anything describing outfield-only shape (e.g. formation
+  recognition, which already excludes the goalkeeper via a positional
+  heuristic instead, independent of this).
 - **Calibration is entirely manual, one shot per camera angle** — no
   automatic pitch-keypoint detection exists (see Roadmap).
 - **MPS (Apple Silicon GPU) training is unreliable.** Fine-tuning a

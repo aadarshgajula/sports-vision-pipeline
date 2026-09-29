@@ -1,5 +1,5 @@
 """Formation recognition: classify a team's shape (e.g. "4-4-2") from its
-players' whole-clip average tracked positions.
+players' tracked positions during out-of-possession (defensive) play.
 
 Deliberately geometric, not learned — by the time this runs, the hard ML
 problems (detection, team classification, pixel-to-pitch calibration) are
@@ -26,11 +26,21 @@ why a naive version of each step would have gotten it wrong:
   goalkeeper can have very low frame presence (play stayed away from their
   box) and would otherwise be discarded before ever being considered,
   silently misidentifying a real outfield defender as the keeper instead.
-- Whole-clip-average line clustering can legitimately fail to find clean
-  bands — open, bunched-up play doesn't always separate along the
-  pitch-length axis even when a team's actual formation is well-defined.
-  This is reported honestly (low confidence, an "indeterminate" label), not
-  forced into a plausible-looking but made-up grouping.
+- A team's true base shape only really holds when it's out of possession —
+  in possession, fullbacks overlap, wingers cut inside, a striker drops
+  deep, all deliberately breaking formation to create attacking options.
+  Averaging those moments in with defensive ones (an earlier version of
+  this module used the whole clip regardless of phase) smears a real,
+  well-defined formation into something that doesn't band cleanly at all —
+  confirmed directly: the same clip that reports a clean formation from
+  defensive-phase frames alone reports "indeterminate" from the whole clip.
+  _defensive_phase_df() restricts to frames where the other team is closer
+  to the ball, falling back to the whole clip (with a caveat) if too few
+  such frames exist.
+- Even restricted to defensive phases, line clustering can still legitimately
+  fail to find clean bands on a short or unusual clip. This is reported
+  honestly (low confidence, an "indeterminate" label), not forced into a
+  plausible-looking but made-up grouping.
 """
 
 from __future__ import annotations
@@ -43,6 +53,7 @@ import numpy as np
 import pandas as pd
 
 from configs.field_config import PENALTY_AREA_DEPTH, PITCH_LENGTH, PITCH_WIDTH
+from src.utils.ball_track_cleaning import clean_ball_track
 from src.utils.pitch_drawing import TEAM_COLORS_BGR, draw_pitch_base, m2px
 
 MIN_TRACK_FRAMES = 5  # reject one-off noise / a stray misclassified row
@@ -52,6 +63,21 @@ AMBIGUOUS_CUTOFF_RATIO = 0.15  # flag a near-tie at the top-K inclusion boundary
 LINE_GAP_CANDIDATES_M = (4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 12.0)
 BOUNDS_MARGIN_M = 5.0  # tolerate boundary-line players + minor homography noise
 DEFENSIVE_LINE_SIZES = (3, 4, 5)  # real back-lines are never 1, 2, or 6+ players
+MIN_DEFENSIVE_PHASE_FRAMES = 50  # below this, the out-of-possession filter has too little to work with
+
+# Used only as a last-resort fallback when no threshold in LINE_GAP_CANDIDATES_M
+# produces a naturally gap-separated, plausible grouping. Rather than surface
+# a diagnostic "bands found: 1-9"-looking string (which reads as a real, if
+# bizarre, formation and was reported as exactly that confusion), force-fit
+# the sorted depths into whichever of these real, commonly-used formations
+# has the lowest within-line variance. Always a real formation name; accuracy
+# at this point is a best-effort guess over a naturally messy distribution,
+# not a confirmed grouping — always tagged confidence="low" with a caveat.
+COMMON_FORMATIONS: tuple[tuple[int, ...], ...] = (
+    (4, 4, 2), (4, 3, 3), (4, 2, 3, 1), (4, 1, 4, 1), (4, 5, 1), (4, 1, 3, 2), (4, 3, 1, 2),
+    (3, 5, 2), (3, 4, 3), (3, 4, 1, 2),
+    (5, 3, 2), (5, 4, 1), (5, 2, 3),
+)
 
 
 @dataclass
@@ -75,8 +101,57 @@ class FormationResult:
     own_goal_x: float
     n_candidate_tracks: int
     n_included_tracks: int
-    line_gap_threshold_used_m: float
+    line_gap_threshold_used_m: float | None  # None when a common-formation best-fit was used instead of a gap threshold
     caveats: list[str] = field(default_factory=list)
+
+
+def _defensive_phase_df(df: pd.DataFrame, team: int) -> tuple[pd.DataFrame, str | None]:
+    """Restricts df to frames where `team` is out of possession (a ball-
+    distance proxy: whichever team has the closer player to the ball is
+    "in possession" that frame). A team's formation is only meaningful as
+    its organized defensive shape — in possession, fullbacks overlap,
+    wingers cut inside, and a striker drops deep, all deliberately breaking
+    the base shape to create attacking options. Averaging those moments in
+    with defensive ones (the previous behavior: whole-clip median,
+    regardless of phase) smears a real, well-defined formation into
+    something that doesn't band cleanly at all, which is exactly the
+    "doesn't work when the team is mid-play" failure this was built to fix.
+
+    Returns (filtered_df, caveat_or_None). Falls back to the full df
+    (caveat explaining why) if too few frames survive — a short clip could
+    be almost entirely one team attacking, in which case there's no
+    meaningful defensive-phase sample to restrict to."""
+    players = df[df["class_name"] == "person"].dropna(subset=["pitch_x", "pitch_y", "bbox_height"])
+    if players.empty or "team" not in players or players["team"].dropna().nunique() < 2:
+        return df, None
+
+    player_scale = players.groupby("frame")["bbox_height"].median()
+    ball = clean_ball_track(df, "pitch_x", "pitch_y", player_scale).dropna(subset=["pitch_x"])
+    if ball.empty:
+        return df, "Could not determine ball position to isolate defensive-phase frames; used all frames instead."
+
+    by_frame_team = players.groupby(["frame", "team"])[["pitch_x", "pitch_y"]]
+    closest_dist = {}
+    for (frame, frame_team), group in by_frame_team:
+        if frame not in ball.index:
+            continue
+        bx, by = ball.at[frame, "pitch_x"], ball.at[frame, "pitch_y"]
+        d = np.hypot(group["pitch_x"] - bx, group["pitch_y"] - by).min()
+        closest_dist.setdefault(frame, {})[int(frame_team)] = d
+
+    defensive_frames = {
+        frame for frame, dists in closest_dist.items()
+        if len(dists) == 2 and min(dists, key=dists.get) != team
+    }
+    filtered = df[df["frame"].isin(defensive_frames)]
+    n_team_rows = len(filtered[(filtered["class_name"] == "person") & (filtered["team"] == team)])
+    if len(defensive_frames) < MIN_DEFENSIVE_PHASE_FRAMES or n_team_rows < MIN_TRACK_FRAMES * EXPECTED_OUTFIELD_COUNT:
+        return df, (
+            f"Only {len(defensive_frames)} frames of clear out-of-possession play found for this "
+            f"team — not enough to isolate a defensive shape, so this used the whole clip instead "
+            f"(may be less accurate during open, dynamic play)."
+        )
+    return filtered, None
 
 
 def _candidate_pool(df: pd.DataFrame, team: int) -> pd.DataFrame:
@@ -188,6 +263,36 @@ def _plausible(lines: list[list[int]]) -> bool:
     return True
 
 
+def _best_fit_common_formation(depth: np.ndarray) -> tuple[list[list[int]], tuple[int, ...]] | None:
+    """Force-fits the sorted depths into whichever whitelisted formation
+    shape has the lowest total within-line variance (sum of squared
+    deviations from each line's own mean depth) — a deterministic,
+    always-real-formation fallback for when no gap threshold produced a
+    naturally separated, plausible grouping. None only if no whitelist
+    entry's player count matches (e.g. fewer than 10 outfield tracks were
+    available; there's no meaningful "the 4-4-2 with 2 defenders" case)."""
+    n = len(depth)
+    order = np.argsort(depth)
+    sorted_depth = depth[order]
+
+    best_shape, best_sse, best_partition = None, float("inf"), None
+    for shape in COMMON_FORMATIONS:
+        if sum(shape) != n:
+            continue
+        partition, sse, start = [], 0.0, 0
+        for size in shape:
+            idx = order[start:start + size]
+            group_depth = sorted_depth[start:start + size]
+            sse += float(np.sum((group_depth - group_depth.mean()) ** 2))
+            partition.append(idx.tolist())
+            start += size
+        if sse < best_sse:
+            best_shape, best_sse, best_partition = shape, sse, partition
+    if best_shape is None:
+        return None
+    return best_partition, best_shape
+
+
 def detect_formation(
     df: pd.DataFrame,
     team: int,
@@ -208,7 +313,11 @@ def detect_formation(
             f"during this clip (play may have stayed away from this team's defensive third)."
         )
 
-    pool = _candidate_pool(df, team)
+    defensive_df, defensive_phase_caveat = _defensive_phase_df(df, team)
+    if defensive_phase_caveat:
+        caveats.append(defensive_phase_caveat)
+
+    pool = _candidate_pool(defensive_df, team)
     n_candidate_tracks = len(pool)
     if gk_track_id is not None:
         pool = pool[pool["track_id"] != gk_track_id]
@@ -271,21 +380,33 @@ def detect_formation(
             break
 
     if chosen_lines is None:
-        chosen_lines = _cluster_lines(depth, 8.0)
-        chosen_threshold = 8.0
-        confidence = "low"
-        sizes = "-".join(str(len(l)) for l in sorted(chosen_lines, key=lambda l: depth[l].mean()))
-        formation_label = f"indeterminate ({n_included_tracks} players, bands found: {sizes})"
-        caveats.append(
-            "No plausible line grouping found across gap thresholds 4-12m — this clip's "
-            "whole-average positions don't band cleanly along the pitch length axis. This "
-            "can happen with a short clip of open, bunched-up play even when the team's "
-            "real formation is well-defined; not necessarily a tracking error. It can also "
-            "happen when a single outfield player sits far closer to goal than the rest of "
-            "the team — a real defensive line is always 3-5 players, so a grouping that "
-            "isolates one such player as its own line is rejected outright rather than "
-            "reported as if it were a real formation."
-        )
+        fallback = _best_fit_common_formation(depth)
+        if fallback is not None:
+            chosen_lines, chosen_shape = fallback
+            chosen_threshold = None
+            confidence = "low"
+            formation_label = "-".join(str(s) for s in chosen_shape)
+            caveats.append(
+                "No gap threshold (4-12m) produced a naturally separated grouping — this "
+                f"clip's positions don't band cleanly along the pitch length axis (open, "
+                f"bunched-up play, or a short window without a settled defensive shape). "
+                f"'{formation_label}' is a best-fit match to the closest common formation, "
+                f"not a grouping that separated on its own — treat it as a low-confidence "
+                f"guess, not a confirmed shape."
+            )
+        else:
+            chosen_lines = _cluster_lines(depth, 8.0)
+            chosen_threshold = 8.0
+            confidence = "low"
+            sizes = "-".join(str(len(l)) for l in sorted(chosen_lines, key=lambda l: depth[l].mean()))
+            formation_label = f"indeterminate ({n_included_tracks} players, bands found: {sizes})"
+            caveats.append(
+                f"No plausible line grouping found, and no common formation has exactly "
+                f"{n_included_tracks} outfield players to fit against (fewer than the expected "
+                f"{expected_outfield_count} were tracked) — this can happen with a short clip "
+                f"of open, bunched-up play even when the team's real formation is well-defined; "
+                f"not necessarily a tracking error."
+            )
     else:
         chosen_lines = sorted(chosen_lines, key=lambda l: depth[l].mean())
         formation_label = "-".join(str(len(l)) for l in chosen_lines)
@@ -326,33 +447,6 @@ def detect_formation(
     )
 
 
-_CAVEAT_FONT_SCALE = 0.42
-_CAVEAT_LINE_HEIGHT = 18
-_CAVEAT_FONT = cv2.FONT_HERSHEY_SIMPLEX
-
-
-def _wrap_text(text: str, max_width_px: int) -> list[str]:
-    """Word-wraps `text` to fit `max_width_px`, measured with the same font/
-    scale it'll actually be drawn with — draw_pitch_base()'s margin (40px)
-    is nowhere near tall enough to hold a caveat sentence on one line, so
-    this is required, not cosmetic; truncating to a fixed character count
-    instead (an earlier version of this function did that) silently drops
-    the second half of a caveat and reads as garbled/overlapping text."""
-    words = text.split()
-    lines, current = [], ""
-    for word in words:
-        candidate = f"{current} {word}".strip()
-        width = cv2.getTextSize(candidate, _CAVEAT_FONT, _CAVEAT_FONT_SCALE, 1)[0][0]
-        if width > max_width_px and current:
-            lines.append(current)
-            current = word
-        else:
-            current = candidate
-    if current:
-        lines.append(current)
-    return lines
-
-
 def draw_formation(result: FormationResult, out_path: str, title: str | None = None) -> None:
     pitch_canvas = draw_pitch_base()
     color = TEAM_COLORS_BGR.get(result.team, (160, 160, 160))
@@ -386,25 +480,7 @@ def draw_formation(result: FormationResult, out_path: str, title: str | None = N
     header = title or f"Team {result.team}: {result.formation_label} (confidence: {result.confidence})"
     cv2.putText(canvas, header, (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1)
 
-    # Caveats get a dedicated footer panel appended below the pitch, not
-    # crammed into draw_pitch_base()'s 40px margin (nowhere near enough for
-    # even one wrapped line, let alone several — see _wrap_text's docstring).
-    footer_width = canvas.shape[1] - 20
-    # OpenCV's built-in HERSHEY fonts don't cover the em-dash (renders as
-    # "???"); swap it for a plain hyphen for the image only — the console
-    # output from generate_analytics.py's print() already shows it correctly.
-    ascii_caveats = [c.replace("—", "-") for c in result.caveats]
-    wrapped_lines = [line for caveat in ascii_caveats for line in _wrap_text(caveat, footer_width)]
-
-    if wrapped_lines:
-        footer_height = 10 + _CAVEAT_LINE_HEIGHT * len(wrapped_lines) + 10
-        extended = np.full((canvas.shape[0] + footer_height, canvas.shape[1], 3), (30, 30, 30), dtype=np.uint8)
-        extended[: canvas.shape[0]] = canvas
-        y = canvas.shape[0] + 10 + _CAVEAT_LINE_HEIGHT
-        for line in wrapped_lines:
-            cv2.putText(extended, line, (10, y), _CAVEAT_FONT, _CAVEAT_FONT_SCALE, (150, 200, 255), 1)
-            y += _CAVEAT_LINE_HEIGHT
-        canvas = extended
-
+    # Caveats are still returned on FormationResult (and printed to the
+    # console by generate_analytics.py) — just not drawn on the image itself.
     Path(out_path).parent.mkdir(parents=True, exist_ok=True)
     cv2.imwrite(out_path, canvas)

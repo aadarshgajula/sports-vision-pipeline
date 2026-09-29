@@ -74,6 +74,7 @@ def create_job(video_bytes: bytes, filename: str) -> dict:
         "error": None,
         "homography_path": None,
         "calibration_quality": None,
+        "team_anchor_paths": None,
         "results": None,
         "warnings": [],
         "formations": [],
@@ -137,16 +138,177 @@ def save_calibration(job_id: str, correspondences: list[dict]) -> dict:
     return quality
 
 
+# A fixed-pixel box around a click is wrong on tactical-cam footage: players
+# are small and a fixed box is almost entirely background grass with a
+# sliver of jersey in the middle, so every anchor ends up ~the same grass
+# green regardless of team (verified directly against a real saved anchor
+# crop — this was the actual bug behind team classification still being
+# wrong after switching to anchors). Instead, run the real detector once on
+# the clicked frame and crop_torso() the detection box under the click, the
+# same way every runtime crop is made — so the anchor is comparable to what
+# it'll actually be matched against, and correctly scaled to the player's
+# real size regardless of camera zoom.
+_detector_cache: dict[str, "Detector"] = {}
+
+
+def _get_anchor_detector():
+    from src.detection.detector import Detector
+
+    if DFL_MODEL_PATH not in _detector_cache:
+        _detector_cache[DFL_MODEL_PATH] = Detector(
+            model_path=DFL_MODEL_PATH,
+            device="cpu",
+            confidence_threshold=0.25,
+            ball_confidence_threshold=0.1,
+            classes=[0, 1, 2],
+            class_name_overrides={0: "sports ball", 1: "person"},
+            singleton_class_ids=[0],
+            ball_class_id=0,
+        )
+    return _detector_cache[DFL_MODEL_PATH]
+
+
+def _find_box_at_point(detections, x: float, y: float, max_center_dist: float = 80.0):
+    """Returns the xyxy box a click most likely landed on: prefer the
+    smallest box that actually contains the point (smallest, so a click on
+    a player standing in front of a bigger overlapping box picks the
+    player, not the background one), else the nearest box center within
+    max_center_dist (a near-miss click at the edge of a player). None if
+    nothing plausible is nearby — better to ask the user to click again
+    than silently anchor on the wrong thing."""
+    best_containing, best_area = None, float("inf")
+    nearest_dist, nearest_box = float("inf"), None
+    for i in range(len(detections)):
+        x1, y1, x2, y2 = detections.xyxy[i]
+        area = (x2 - x1) * (y2 - y1)
+        if x1 <= x <= x2 and y1 <= y <= y2 and area < best_area:
+            best_containing, best_area = detections.xyxy[i], area
+        cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
+        dist = ((cx - x) ** 2 + (cy - y) ** 2) ** 0.5
+        if dist < nearest_dist:
+            nearest_dist, nearest_box = dist, detections.xyxy[i]
+    if best_containing is not None:
+        return best_containing
+    if nearest_dist <= max_center_dist:
+        return nearest_box
+    return None
+
+
+# On wide tactical-cam footage a player can be as little as 15-25px tall.
+# At that scale a single frame's crop isn't enough: a person's silhouette
+# (gaps around arms/legs, motion blur) means grass shows through *inside*
+# even a perfectly tight box, so a one-frame mean color is still mostly
+# grass — verified directly against this project's own test footage, not a
+# theoretical worry. Two fixes, used together: exclude grass-colored pixels
+# from the average (src/team_classification/classifier.py's _non_grass_pixels
+# — shared with runtime prediction, since comparing a clean anchor against
+# an uncleaned query would bias matches toward whichever anchor sits closer
+# to grass-mixed color), and follow the same clicked player for a few more
+# frames to average over multiple poses instead of trusting whichever gaps
+# happened to line up in one frame.
+ANCHOR_TRACK_FRAMES = 20
+ANCHOR_TRACK_MAX_CENTER_DIST = 40.0
+
+
+def _track_forward(detector, cap, start_frame_idx: int, start_box, n_frames: int):
+    """Follows the same player for a few frames after the click by
+    nearest-box-center matching — no need for the full ByteTrack, just
+    enough to gather more color evidence than one frame. Stops as soon as
+    the nearest box is too far to plausibly be the same player, rather than
+    risk drifting onto someone else."""
+    boxes = [start_box]
+    cx, cy = (start_box[0] + start_box[2]) / 2, (start_box[1] + start_box[3]) / 2
+    for offset in range(1, n_frames):
+        idx = start_frame_idx + offset
+        cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+        ok, frame = cap.read()
+        if not ok:
+            break
+        box = _find_box_at_point(detector.detect(frame), cx, cy, max_center_dist=ANCHOR_TRACK_MAX_CENTER_DIST)
+        if box is None:
+            break
+        boxes.append(box)
+        cx, cy = (box[0] + box[2]) / 2, (box[1] + box[3]) / 2
+    return boxes
+
+
+def save_team_anchors(job_id: str, points: list[dict]) -> dict:
+    """points: [{"pixel": [x,y], "label": "0" | "1" | "referee", "frame_index": int}, ...]
+    — one example player click per team (referee optional). Each point
+    carries its own frame_index since the best frame to click "a clear
+    Team A player" on isn't necessarily the same frame as "a clear
+    referee" one. Saves the clicked frame's crop for the user to see, but
+    the color actually used for matching is aggregated over several
+    tracked frames — see module comment above."""
+    import numpy as np
+
+    from src.team_classification.classifier import _non_grass_pixels, crop_torso
+
+    job = get_job(job_id)
+    labels = {p["label"] for p in points}
+    if "0" not in labels or "1" not in labels:
+        raise ValueError("Need at least a team 0 and team 1 anchor point")
+
+    detector = _get_anchor_detector()
+    anchors_dir = Path(job["dir"]) / "anchors"
+    anchors_dir.mkdir(exist_ok=True)
+    cap = cv2.VideoCapture(job["video_path"])
+    anchor_paths = {}
+    try:
+        for p in points:
+            idx = max(0, min(p["frame_index"], job["frame_count"] - 1))
+            cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+            ok, frame = cap.read()
+            if not ok:
+                raise ValueError(f"Could not read frame {idx}")
+            x, y = p["pixel"]
+            detections = detector.detect(frame)
+            box = _find_box_at_point(detections, x, y)
+            if box is None:
+                raise ValueError(
+                    f"No player detected near your click for '{p['label']}' — "
+                    f"try clicking more precisely on a clearly visible player."
+                )
+            first_crop = crop_torso(frame, box)
+
+            boxes = _track_forward(detector, cap, idx, box, ANCHOR_TRACK_FRAMES)
+            cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+            pixel_batches = []
+            for tracked_box in boxes:
+                ok, f = cap.read()
+                if not ok:
+                    break
+                pixel_batches.append(_non_grass_pixels(crop_torso(f, tracked_box)))
+            all_pixels = np.concatenate(pixel_batches, axis=0)
+            anchor_color = all_pixels.mean(axis=0)
+
+            # Save a small solid-color swatch as the "anchor crop" — this is
+            # what TeamClassifier actually reads (its mean IS this color),
+            # while first_crop stays only as a human-visible reference.
+            swatch = np.full((10, 10, 3), anchor_color, dtype=np.uint8)
+            out_path = anchors_dir / f"{p['label']}.png"
+            cv2.imwrite(str(out_path), swatch)
+            cv2.imwrite(str(anchors_dir / f"{p['label']}_preview.png"), first_crop)
+            anchor_paths[p["label"]] = str(out_path)
+    finally:
+        cap.release()
+
+    job["team_anchor_paths"] = anchor_paths
+    return anchor_paths
+
+
 def _write_pipeline_config(job: dict) -> Path:
     config = {
         "device": "mps",
         "detection": {
             "model_path": DFL_MODEL_PATH,
             "confidence_threshold": 0.25,
+            "ball_confidence_threshold": 0.1,
             "iou_threshold": 0.5,
             "classes": [0, 1, 2],
             "class_name_overrides": {0: "sports ball", 1: "person"},
             "singleton_class_ids": [0],
+            "ball_class_id": 0,
         },
         "tracking": {
             "track_activation_threshold": 0.25,
@@ -156,9 +318,10 @@ def _write_pipeline_config(job: dict) -> Path:
         },
         "team_classification": {
             "enabled": True,
-            "min_distinct_tracks": 10,
-            "max_wait_frames": 500,
-            "max_fit_crops": 60,
+            "anchors": {
+                (0 if label == "0" else 1 if label == "1" else "referee"): path
+                for label, path in job["team_anchor_paths"].items()
+            },
         },
         "ball_tracking": {
             "enabled": True,

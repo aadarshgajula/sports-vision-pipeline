@@ -3,19 +3,34 @@
 <head>
 <meta charset="UTF-8">
 <title>Sports Vision Pipeline</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Big+Shoulders+Display:wght@600;700;800&family=Work+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
 <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
-<h1>Sports Vision Pipeline</h1>
-<div class="subtitle">Tactical-cam footage in — annotated video, 2D top-down view, heatmaps, and passing network out.</div>
+<header class="masthead">
+  <p class="eyebrow">Computer vision · tactical-cam football</p>
+  <h1>Sports Vision Pipeline</h1>
+  <div class="subtitle">Upload footage, calibrate once, and get an annotated video, 2D top-down view, heatmaps, passing network, and formation — no further input needed.</div>
+</header>
 
 <div id="screen-upload" class="screen active">
-  <div class="card">
-    <h3>1. Upload a video</h3>
-    <p style="color:#8a949e; font-size:13px;">Wide, fixed tactical-camera footage works best (this is what the model was trained on).</p>
-    <input type="file" id="file-input" accept="video/*">
-    <div style="margin-top:12px;"><button id="upload-btn">Upload</button></div>
-    <div id="upload-status" style="margin-top:10px; color:#8a949e; font-size:13px;"></div>
+  <div class="card upload-card">
+    <div class="step-tag">Step 1</div>
+    <h3>Upload a video</h3>
+    <p class="hint">Wide, fixed tactical-camera footage works best — that's what the detection model was trained on.</p>
+
+    <label for="file-input" class="dropzone" id="dropzone">
+      <div class="dropzone-filename" id="dropzone-filename">No file selected</div>
+      <br>
+      <input type="file" id="file-input" accept="video/*">
+    </label>
+
+    <div class="upload-actions">
+      <br>
+      <button id="upload-btn">Upload &amp; continue</button>
+      <span id="upload-status" class="status-text"></span>
+    </div>
   </div>
 </div>
 
@@ -36,7 +51,22 @@
   <div class="card">
     <h4 style="margin-top:0;">Points added (<span id="point-count">0</span>)</h4>
     <div class="point-list" id="point-list"></div>
-    <div class="row" style="margin-top:14px;">
+  </div>
+  <div class="card">
+    <h3>3. Mark one example player from each team</h3>
+    <p style="color:#8a949e; font-size:13px;">
+      Click a button below, then click that player's jersey on the frame above. This is how the pipeline
+      tells teams apart — no guessing, no color clustering, just the real example you pick.
+    </p>
+    <div class="row">
+      <button id="pick-team0-btn" class="secondary">Pick Team A example</button>
+      <button id="pick-team1-btn" class="secondary">Pick Team B example</button>
+      <button id="pick-referee-btn" class="secondary">Pick referee (optional)</button>
+    </div>
+    <div class="point-list" id="anchor-list" style="margin-top:10px;"></div>
+  </div>
+  <div class="card">
+    <div class="row">
       <button id="save-calibration-btn" disabled>Save Calibration & Run Analysis</button>
       <span id="calibration-feedback" style="font-size:13px;"></span>
     </div>

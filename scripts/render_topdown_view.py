@@ -23,6 +23,7 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from src.utils.ball_track_cleaning import clean_ball_track
 from src.utils.pitch_drawing import (
     BALL_COLOR,
     BALL_PREDICTED_COLOR,
@@ -58,19 +59,42 @@ def main():
     total_frames = int(df["frame"].max()) + 1
     by_frame = {frame: g for frame, g in df.groupby("frame")}
 
+    # The position log already carries the online Kalman tracker's estimate
+    # for the ball (including short coasted gaps, flagged is_predicted), but
+    # it has NO row at all for gaps beyond that tracker's patience — which
+    # would otherwise render as the ball hard-cutting out and teleporting on
+    # reappearance. clean_ball_track() is a second, offline pass over the
+    # complete log that can interpolate straight to wherever the ball is
+    # next actually observed, bridging those remaining gaps smoothly instead
+    # (still leaving genuinely long gaps alone — seeing the full log doesn't
+    # mean guessing across a real loss is honest).
+    player_scale = (
+        df[df["class_name"] == "person"].groupby("frame")["bbox_height"].median()
+    )
+    ball_track = clean_ball_track(df, "pitch_x", "pitch_y", player_scale)
+    raw_is_predicted = (
+        df[df["class_name"] == "sports ball"].set_index("frame")["is_predicted"]
+    )
+
     for frame_idx in range(total_frames):
         canvas = base.copy()
         group = by_frame.get(frame_idx)
+        if frame_idx in ball_track.index and pd.notna(ball_track.at[frame_idx, "pitch_x"]):
+            pt = m2px(ball_track.at[frame_idx, "pitch_x"], ball_track.at[frame_idx, "pitch_y"])
+            # Anything not a direct raw detection this frame — online
+            # Kalman-coasted, or bridged by the offline pass above — gets
+            # the same "inferred, not observed" hollow marker.
+            is_inferred = bool(ball_track.at[frame_idx, "was_interpolated"]) or bool(
+                raw_is_predicted.get(frame_idx, False)
+            )
+            color = BALL_PREDICTED_COLOR if is_inferred else BALL_COLOR
+            cv2.circle(canvas, pt, 5, color, 2 if is_inferred else -1)
         if group is not None:
             for row in group.itertuples():
                 if pd.isna(row.pitch_x) or pd.isna(row.pitch_y):
                     continue
                 pt = m2px(row.pitch_x, row.pitch_y)
-                if row.class_name == "sports ball":
-                    is_pred = getattr(row, "is_predicted", False)
-                    color = BALL_PREDICTED_COLOR if is_pred else BALL_COLOR
-                    cv2.circle(canvas, pt, 5, color, -1 if not is_pred else 2)
-                elif row.class_name == "person":
+                if row.class_name == "person":
                     team = row.team if not pd.isna(row.team) else None
                     color = TEAM_COLORS_BGR.get(team, UNASSIGNED_COLOR)
                     cv2.circle(canvas, pt, args.dot_radius, color, -1)

@@ -132,10 +132,47 @@ def test_deep_sweeper_not_isolated_as_lone_defender():
           result.line_gap_threshold_used_m == 10.0, str(result.line_gap_threshold_used_m))
 
 
+def test_messy_play_never_shows_diagnostic_band_string():
+    """Regression test for real user-reported confusion: when no gap
+    threshold finds a plausible grouping, the old fallback showed
+    "indeterminate (10 players, bands found: 1-9)" — a user read "1-9" as
+    the tool's actual (bizarre) formation guess, not a diagnostic string.
+    Plants 10 outfield players evenly spaced 2m apart in depth (every gap
+    is 2m, below every candidate threshold 4-12m), so every threshold
+    produces one single unbroken line of 10 and fails plausibility
+    (n_lines must be 2-5) — deterministically forcing the fallback path.
+    The label must now always be a real formation name from
+    COMMON_FORMATIONS, never a string containing "bands found" or
+    "indeterminate"."""
+    print("\n--- Test 4: messy/unclustered play must still yield a real formation name ---")
+    from src.analytics.formation import COMMON_FORMATIONS
+
+    rows = []
+    rows += make_rows(0, 1, x=2, y=34, n_frames=200)  # goalkeeper
+    for i in range(10):
+        rows += make_rows(0, 10 + i, x=20 + i * 2, y=10 + (i % 5) * 12, n_frames=200)
+    rows += make_rows(1, 90, x=95, y=34, n_frames=200)
+
+    df = pd.DataFrame(rows)
+    result = detect_formation(df, team=0)
+
+    check("formation label is not a diagnostic string",
+          "indeterminate" not in result.formation_label and "bands found" not in result.formation_label,
+          f"got {result.formation_label!r}")
+    label_shape = tuple(int(x) for x in result.formation_label.split("-"))
+    check("formation label is a real whitelisted formation",
+          label_shape in COMMON_FORMATIONS, f"got {result.formation_label!r}")
+    check("confidence is low (honestly flagged as a best-fit guess)",
+          result.confidence == "low", f"got {result.confidence}")
+    check("a caveat explains this is a best-fit guess, not a confirmed shape",
+          any("best-fit" in c for c in result.caveats), str(result.caveats))
+
+
 if __name__ == "__main__":
     test_clean_4_4_2()
     test_fragmented_tracks()
     test_deep_sweeper_not_isolated_as_lone_defender()
+    test_messy_play_never_shows_diagnostic_band_string()
     print()
     if FAILURES:
         print(f"{len(FAILURES)} check(s) failed: {FAILURES}")

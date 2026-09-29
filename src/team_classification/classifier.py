@@ -1,22 +1,39 @@
-"""Team classification: SigLIP crop embeddings -> UMAP -> KMeans(2).
+"""Team classification: nearest-anchor jersey color match.
 
-Fit once on a batch of player crops gathered early in the clip (kit colors
-don't change mid-match), then predict per-track for the rest of the video.
+Unsupervised color clustering (K-means over hue histograms, then various
+attempts to patch grass contamination, achromatic kits, and a referee
+bucket) turned into an unbounded whack-a-mole: every fix for one kit
+combination surfaced a new failure mode for another, because there was
+never any ground truth to anchor to — only guessed structure.
 
-Known limitation: this is a 2-cluster split (team A / team B). Goalkeepers
-usually wear a third, distinct kit color and will simply get pulled into
-whichever team cluster their color is closer to — good enough for a first
-pass, not correct. A real fix needs outlier/3-cluster handling, which isn't
-built here yet.
+The real fix is to stop guessing. The pipeline already requires one manual
+calibration step per video (pitch homography). This reuses that same
+one-time human step: the user clicks one example player from each team
+(and optionally the referee) once, up front — see webapp/jobs.py. Team
+assignment then becomes nearest-anchor color distance, not clustering.
+Accuracy comes from the human-provided example, not clever feature
+engineering, so the color descriptor itself is deliberately simple: mean
+BGR of the torso crop.
 """
 
 from __future__ import annotations
 
+import cv2
 import numpy as np
-import umap
-from PIL import Image
-from sklearn.cluster import KMeans
-from transformers import SiglipImageProcessor, SiglipVisionModel
+
+# On wide tactical-cam footage a player can be as little as 15-25px tall.
+# At that scale, a person's silhouette (gaps around arms/legs, motion blur)
+# means grass shows through *inside* even a tight torso crop, so a naive
+# mean color is still mostly grass — verified directly against this
+# project's own test footage. Excluding grass pixels (one well-defined,
+# near-constant confound) before averaging is not a reintroduction of the
+# old hue-clustering system — it's a data-cleaning step underneath the same
+# simple supervised nearest-anchor match, applied identically to anchor
+# crops and every runtime crop, since comparing a clean anchor against a
+# dirty query would systematically bias matches toward whichever anchor
+# happens to sit closer to grass-mixed color.
+GRASS_HUE_RANGE = (35, 95)
+GRASS_SAT_MIN = 60
 
 
 def crop_torso(frame: np.ndarray, xyxy: np.ndarray) -> np.ndarray:
@@ -34,57 +51,46 @@ def crop_torso(frame: np.ndarray, xyxy: np.ndarray) -> np.ndarray:
     return crop
 
 
-class TeamClassifier:
-    def __init__(
-        self,
-        device: str = "mps",
-        model_name: str = "google/siglip-base-patch16-224",
-        n_teams: int = 2,
-        umap_components: int = 3,
-    ):
-        self.device = device
-        self.model_name = model_name
-        self.n_teams = n_teams
-        self.umap_components = umap_components
+def _non_grass_pixels(crop_bgr: np.ndarray) -> np.ndarray:
+    hsv = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2HSV)
+    hue, sat = hsv[:, :, 0].astype(float), hsv[:, :, 1].astype(float)
+    lo, hi = GRASS_HUE_RANGE
+    is_grass = (hue >= lo) & (hue <= hi) & (sat >= GRASS_SAT_MIN)
+    pixels = crop_bgr.reshape(-1, 3)
+    keep = ~is_grass.reshape(-1)
+    # If almost everything got excluded (a real green-kitted team, or a
+    # crop that's pure grass because detection missed), fall back to every
+    # pixel rather than averaging 2-3 leftover ones.
+    if keep.sum() < max(3, 0.05 * len(pixels)):
+        return pixels
+    return pixels[keep]
 
-        self._processor: SiglipImageProcessor | None = None
-        self._model: SiglipVisionModel | None = None
-        self._reducer: umap.UMAP | None = None
-        self._kmeans: KMeans | None = None
+
+def _mean_color(crop_bgr: np.ndarray) -> np.ndarray:
+    return _non_grass_pixels(crop_bgr).mean(axis=0)
+
+
+class TeamClassifier:
+    def __init__(self):
+        self._anchors: dict[int | None, np.ndarray] = {}
         self._fitted = False
 
-    def _load_model(self):
-        if self._model is None:
-            self._processor = SiglipImageProcessor.from_pretrained(self.model_name)
-            self._model = SiglipVisionModel.from_pretrained(self.model_name).to(self.device).eval()
-
-    def embed(self, crops: list[np.ndarray]) -> np.ndarray:
-        self._load_model()
-        images = [Image.fromarray(crop[:, :, ::-1]) for crop in crops]  # BGR -> RGB
-        inputs = self._processor(images=images, return_tensors="pt").to(self.device)
-        import torch
-
-        with torch.no_grad():
-            outputs = self._model(**inputs)
-            embeddings = outputs.pooler_output.cpu().numpy()
-        return embeddings
-
-    def fit(self, crops: list[np.ndarray]):
-        if len(crops) < self.n_teams * 2:
-            raise ValueError(
-                f"Need at least {self.n_teams * 2} crops to fit team clusters, got {len(crops)}"
-            )
-        embeddings = self.embed(crops)
-        n_neighbors = min(15, len(embeddings) - 1)
-        self._reducer = umap.UMAP(n_components=self.umap_components, n_neighbors=n_neighbors)
-        reduced = self._reducer.fit_transform(embeddings)
-        self._kmeans = KMeans(n_clusters=self.n_teams, n_init="auto", random_state=0)
-        self._kmeans.fit(reduced)
+    def fit_from_anchors(self, anchor_crops: dict[int | None, np.ndarray]):
+        """anchor_crops: {0: crop, 1: crop, None: crop (referee, optional)} —
+        one example torso crop per category, from the one-time calibration
+        step. None is the referee/other bucket, matching the position log's
+        existing team=None convention for "not on a team."."""
+        if 0 not in anchor_crops or 1 not in anchor_crops:
+            raise ValueError("Need at least a team 0 and team 1 anchor crop")
+        self._anchors = {label: _mean_color(crop) for label, crop in anchor_crops.items()}
         self._fitted = True
 
-    def predict(self, crops: list[np.ndarray]) -> np.ndarray:
+    def predict(self, crops: list[np.ndarray]) -> list[int | None]:
         if not self._fitted:
-            raise RuntimeError("TeamClassifier.fit() must be called before predict()")
-        embeddings = self.embed(crops)
-        reduced = self._reducer.transform(embeddings)
-        return self._kmeans.predict(reduced)
+            raise RuntimeError("TeamClassifier.fit_from_anchors() must be called before predict()")
+        labels = list(self._anchors.keys())
+        anchor_matrix = np.stack([self._anchors[label] for label in labels])
+        colors = np.stack([_mean_color(crop) for crop in crops])
+        dists = np.linalg.norm(colors[:, None, :] - anchor_matrix[None, :, :], axis=2)
+        nearest = dists.argmin(axis=1)
+        return [labels[i] for i in nearest]

@@ -76,6 +76,18 @@ async def calibrate(job_id: str, correspondences: list[dict]):
     return quality
 
 
+@app.post("/api/jobs/{job_id}/team_anchors")
+async def team_anchors(job_id: str, points: list[dict]):
+    """points: [{"pixel": [x,y], "label": "0"|"1"|"referee", "frame_index": int}, ...]"""
+    try:
+        paths = jobs.save_team_anchors(job_id, points)
+    except KeyError:
+        raise HTTPException(404, "Unknown job")
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return {"anchor_paths": paths}
+
+
 @app.post("/api/jobs/{job_id}/run")
 def run_job(job_id: str):
     try:
@@ -84,6 +96,8 @@ def run_job(job_id: str):
         raise HTTPException(404, "Unknown job")
     if not job["homography_path"]:
         raise HTTPException(400, "Calibrate this video before running analysis")
+    if not job["team_anchor_paths"]:
+        raise HTTPException(400, "Mark one example player per team before running analysis")
     jobs.start_job(job_id)
     return {"status": "started"}
 

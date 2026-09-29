@@ -58,7 +58,7 @@ def main():
         if not avg_dist.empty:
             print(avg_dist.groupby("team")["avg_distance_m"].mean())
 
-        print("\nFormation recognition (whole-clip average position, heuristic — see caveats):")
+        print("\nFormation recognition (defensive-phase average position, heuristic — see caveats):")
         for team in sorted(df["team"].dropna().unique()):
             team = int(team)
             try:

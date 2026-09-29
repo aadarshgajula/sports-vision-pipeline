@@ -30,53 +30,19 @@ import networkx as nx
 import numpy as np
 import pandas as pd
 
+from src.utils.ball_track_cleaning import (
+    DEFAULT_MAX_BALL_GAP_FRAMES,
+    DEFAULT_MAX_BALL_JUMP_SCALE,
+    clean_ball_track,
+)
+
 DEFAULT_PIXEL_RADIUS_SCALE = 0.6  # possession radius = this * median player bbox_height
-DEFAULT_MAX_BALL_GAP_FRAMES = 10  # interpolate ball position across gaps up to this long
-DEFAULT_MAX_BALL_JUMP_SCALE = 5.0  # reject a ball detection that jumps > this * local player scale
 
 
 def _coords(df: pd.DataFrame) -> tuple[pd.DataFrame, str, str]:
     if df["pitch_x"].notna().any():
         return df, "pitch_x", "pitch_y"
     return df, "pixel_x", "pixel_y"
-
-
-def _clean_ball_track(
-    df: pd.DataFrame,
-    xcol: str,
-    ycol: str,
-    player_scale: pd.Series,
-    max_gap_frames: int,
-    max_jump_scale: float,
-) -> pd.DataFrame:
-    """Returns a frame-indexed ball position series with outlier jumps
-    dropped and short gaps linearly interpolated."""
-    ball = df[df["class_name"] == "sports ball"][["frame", xcol, ycol]].dropna()
-    if ball.empty:
-        return ball.set_index("frame")
-    ball = ball.sort_values("frame").set_index("frame")
-    global_scale = player_scale.median() if not player_scale.empty else 1.0
-
-    cleaned_rows = []
-    last_good = None
-    last_good_frame = None
-    for frame, row in ball.iterrows():
-        point = np.array([row[xcol], row[ycol]])
-        if last_good is not None:
-            scale = player_scale.get(frame, global_scale) or global_scale
-            dist = np.hypot(*(point - last_good))
-            frame_gap = max(frame - last_good_frame, 1)
-            if dist > max_jump_scale * scale * frame_gap:
-                continue  # outlier: too fast to be the real ball, drop this detection
-        cleaned_rows.append((frame, point[0], point[1]))
-        last_good, last_good_frame = point, frame
-
-    if not cleaned_rows:
-        return pd.DataFrame(columns=[xcol, ycol])
-
-    cleaned = pd.DataFrame(cleaned_rows, columns=["frame", xcol, ycol]).set_index("frame")
-    full_index = pd.RangeIndex(cleaned.index.min(), cleaned.index.max() + 1, name="frame")
-    return cleaned.reindex(full_index).interpolate(method="linear", limit=max_gap_frames, limit_area="inside")
 
 
 def infer_possessor_per_frame(
@@ -88,10 +54,15 @@ def infer_possessor_per_frame(
 ) -> pd.DataFrame:
     df, xcol, ycol = _coords(df)
     is_pitch_space = xcol == "pitch_x"
-    players = df[df["class_name"] != "sports ball"].dropna(subset=[xcol, ycol])
+    # Restrict to real players, not just "not the ball": class_name != "sports
+    # ball" also lets the referee through as a possession candidate whenever
+    # they're closest to the ball, which they often are (they run near play
+    # by definition) — a referee doesn't "pass" the ball to anyone, so this
+    # was corrupting real passing sequences into false turnovers/phantom runs.
+    players = df[df["class_name"] == "person"].dropna(subset=[xcol, ycol])
 
     player_scale = players.groupby("frame")["bbox_height"].median() if "bbox_height" in players else pd.Series(dtype=float)
-    ball = _clean_ball_track(df, xcol, ycol, player_scale, max_ball_gap_frames, max_ball_jump_scale)
+    ball = clean_ball_track(df, xcol, ycol, player_scale, max_ball_gap_frames, max_ball_jump_scale)
     ball = ball.rename(columns={xcol: "ball_x", ycol: "ball_y"}).reset_index()
 
     merged = players.merge(ball, on="frame", how="inner")
@@ -181,16 +152,18 @@ def build_passing_network(
     runs = compute_possession_runs(df, possession_radius, min_possession_frames, **possessor_kwargs)
 
     df, xcol, ycol = _coords(df)
-    avg_pos = df[df["class_name"] != "sports ball"].groupby("track_id")[[xcol, ycol]].mean()
+    avg_pos = df[df["class_name"] == "person"].groupby("track_id")[[xcol, ycol]].mean()
 
     # .iterrows() upcasts every value in a row to a common dtype, so track_id
     # (int64) would silently become float64 next to the float64 team column —
     # cast back to int explicitly rather than storing float-keyed nodes.
     graph = nx.Graph()
+    graph.graph["is_pitch_space"] = xcol == "pitch_x"
     for _, row in runs.iterrows():
         track_id = int(row["track_id"])
-        pos = avg_pos.loc[track_id] if track_id in avg_pos.index else (0.0, 0.0)
-        graph.add_node(track_id, team=row["team"], pos=(pos[xcol], pos[ycol]), touches=0)
+        if track_id not in graph:
+            pos = avg_pos.loc[track_id] if track_id in avg_pos.index else (0.0, 0.0)
+            graph.add_node(track_id, team=row["team"], pos=(pos[xcol], pos[ycol]), touches=0)
         graph.nodes[track_id]["touches"] += 1
 
     for (_, prev), (_, curr) in zip(runs.iterrows(), runs.iloc[1:].iterrows()):
@@ -223,10 +196,30 @@ def draw_passing_network(graph: nx.Graph, out_path: str, title: str | None = Non
     edge_widths = [1 + graph[u][v]["weight"] for u, v in graph.edges]
 
     fig, ax = plt.subplots(figsize=(10, 7))
+
+    if graph.graph.get("is_pitch_space", False):
+        # Draw on the same schematic pitch used everywhere else in this
+        # project (formation diagrams, the top-down view) instead of a bare
+        # floating graph with no spatial reference — node positions are real
+        # pitch meters, meaningless without the pitch itself for context.
+        # Converting to the pitch canvas's pixel space (via m2px) also fixes
+        # a second problem: pitch_y increases downward (image convention)
+        # but matplotlib's y-axis increases upward by default, so plotting
+        # raw meters directly would render the whole network upside-down
+        # relative to the real pitch — imshow displays array rows top-to-
+        # bottom, which already matches pixel-space "y increases downward."
+        from src.utils.pitch_drawing import draw_pitch_base, m2px
+
+        pitch_img = draw_pitch_base()
+        ax.imshow(pitch_img[:, :, ::-1])  # BGR -> RGB
+        pos = {n: m2px(x, y) for n, (x, y) in pos.items()}
+        ax.set_xlim(0, pitch_img.shape[1])
+        ax.set_ylim(pitch_img.shape[0], 0)
+        ax.axis("off")
+
     nx.draw(
         graph, pos, ax=ax, node_color=node_colors, node_size=node_sizes,
-        width=edge_widths, edge_color="#cccccc", with_labels=True, font_size=8,
-        font_color="white",
+        width=edge_widths, edge_color="#cccccc", with_labels=False,
     )
     if title:
         ax.set_title(title)

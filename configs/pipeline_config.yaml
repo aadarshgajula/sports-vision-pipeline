@@ -21,9 +21,11 @@ detection:
   # revisiting if the training set grows more diverse:
   # model_path: data/models/football_ball_player_v3_epoch39_best.pt
   # confidence_threshold: 0.25
+  # ball_confidence_threshold: 0.1  # ball is much smaller/blurrier than a person box; needs its own, lower bar
   # classes: [0, 1]  # matches detection_clean/data.yaml's names: [ball, player]
   # class_name_overrides: {0: sports ball, 1: person}
   # singleton_class_ids: [0]  # only one ball is ever in play
+  # ball_class_id: 0  # tells the detector which class id gets ball_confidence_threshold instead of confidence_threshold
 
 tracking:
   track_activation_threshold: 0.25
@@ -33,13 +35,14 @@ tracking:
 
 team_classification:
   enabled: true
-  # Wait for at least this many DISTINCT players before fitting the team
-  # clusters — fitting on only 1-2 individuals (e.g. during an opening
-  # close-up shot) teaches the classifier "person A vs person B," not
-  # "kit color A vs kit color B," and it won't generalize to new players.
-  min_distinct_tracks: 10
-  max_wait_frames: 500 # give up team classification if this diversity never appears
-  max_fit_crops: 60
+  # Nearest-anchor color match, not clustering: one example player crop per
+  # team (referee optional), normally produced by the web app's one-time
+  # calibration step (webapp/jobs.py saves these under a job's anchors/
+  # dir). For CLI runs without the web app, point these at your own crops.
+  anchors:
+    0: data/models/.anchors_example/team0.png
+    1: data/models/.anchors_example/team1.png
+    # referee: data/models/.anchors_example/referee.png
 
 ball_tracking:
   enabled: true

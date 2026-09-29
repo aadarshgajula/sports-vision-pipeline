@@ -2,14 +2,14 @@
 calibrate to pitch coordinates -> annotate video + write a position log for
 the analytics stage (src/analytics/).
 
-Team classification is fit once a diverse-enough buffer of distinct-track
-torso crops is gathered (not just "the first N frames" — a broadcast feed
-often opens on a tight 2-player close-up, and fitting the color clusters on
-2 individuals means the classifier learns "person A vs person B," not
-"kit color A vs kit color B," and won't generalize once more players enter
-frame). After fitting, each track's team is decided once and cached — re-
-running SigLIP on every detection every frame would be wasteful and would
-risk a track flip-flopping between teams frame to frame.
+Team classification is nearest-anchor color matching, not unsupervised
+clustering: the user provides one example player crop per team (and
+optionally the referee) during the video's one-time manual calibration step
+(webapp/jobs.py), and each track is classified by which anchor its jersey
+color is closest to. Each track is reclassified on its first few sightings
+and locked in by majority vote rather than trusting a single crop — one
+blurry or backlit frame shouldn't permanently decide a track's team. Once
+locked in, later sightings are a cached dict lookup, not a model call.
 
 Calibration (pixel -> pitch meters) is optional: without a homography file
 (see scripts/calibrate_pitch.py), pitch_x/pitch_y in the position log stay
@@ -21,6 +21,7 @@ and the pixel-space passing network all still work.
 from __future__ import annotations
 
 import argparse
+from collections import Counter, defaultdict
 from pathlib import Path
 
 import cv2
@@ -49,79 +50,53 @@ def load_config(path: str) -> dict:
 
 
 class TeamAssigner:
-    """Fits a TeamClassifier once enough distinct players have been seen,
-    then caches a team id per track_id so later frames are a dict lookup,
-    not a model call.
-
-    Buffers ONE torso crop per distinct track_id (first sighting), not every
-    crop from every frame — repeated crops of the same 1-2 players (e.g. a
-    tight close-up shot at the start of a clip) wouldn't give the color
-    clusters enough real diversity to generalize to players never seen
-    during fitting.
+    """Classifies each track's team by nearest-anchor color distance (see
+    TeamClassifier), using one example crop per team — and optionally the
+    referee — provided once during the video's manual calibration step
+    (webapp/jobs.py). Locks in each track's team by majority vote over its
+    first few sightings rather than trusting a single crop — one blurry or
+    backlit frame shouldn't permanently decide a track's team. Once locked
+    in, later frames are a dict lookup, not a model call.
     """
 
-    MIN_FIT_CROPS = 20  # UMAP's spectral init needs enough samples relative to n_neighbors
+    SMOOTHING_MIN_VOTES = 5  # classifications needed before a track's team locks in
 
-    def __init__(self, device: str, min_distinct_tracks: int, max_wait_frames: int, max_fit_crops: int):
-        self.classifier = TeamClassifier(device=device)
-        self.min_distinct_tracks = min_distinct_tracks
-        self.max_wait_frames = max_wait_frames
-        self.max_fit_crops = max_fit_crops
-        self._buffer_crop_by_track: dict[int, np.ndarray] = {}
-        self._fitted = False
-        self._gave_up = False
-        self._team_cache: dict[int, int] = {}
+    def __init__(self, anchor_crops: dict[int | None, np.ndarray]):
+        self.classifier = TeamClassifier()
+        self.classifier.fit_from_anchors(anchor_crops)
+        self._votes: dict[int, Counter] = defaultdict(Counter)
+        self._team_cache: dict[int, int | None] = {}
 
-    def _maybe_fit(self, frame_idx: int):
-        if self._fitted or self._gave_up:
-            return
-        n = len(self._buffer_crop_by_track)
-        # Require both: enough distinct players (the real diversity signal) AND
-        # enough absolute samples for UMAP's spectral init to behave. If the
-        # diversity target is hit early but sample count is still short, keep
-        # buffering rather than fitting on too little (or giving up too soon).
-        ready = n >= max(self.min_distinct_tracks, self.MIN_FIT_CROPS)
-        deadline_hit = frame_idx >= self.max_wait_frames
-        if not ready:
-            if deadline_hit:
-                self._gave_up = True  # never saw enough distinct players; skip team classification
-                print(f"TeamAssigner: only {n} distinct tracks by frame {frame_idx} "
-                      f"— giving up on team classification for this clip")
-            return
+    def _record_vote(self, track_id: int, team: int | None) -> int | None:
+        """Adds one classification to a track's running tally, locking in
+        the majority result once enough independent crops have weighed in.
+        Returns the current best guess (locked or still-running) so callers
+        always have a usable value, not a long stretch of None while votes
+        accumulate."""
+        if track_id in self._team_cache:
+            return self._team_cache[track_id]
+        votes = self._votes[track_id]
+        votes[team] += 1
+        if sum(votes.values()) >= self.SMOOTHING_MIN_VOTES:
+            self._team_cache[track_id] = votes.most_common(1)[0][0]
+        return votes.most_common(1)[0][0]
 
-        track_ids = list(self._buffer_crop_by_track.keys())
-        crops = list(self._buffer_crop_by_track.values())
-        self.classifier.fit(crops)
-        self._fitted = True
-        predictions = self.classifier.predict(crops)
-        for track_id, team in zip(track_ids, predictions):
-            self._team_cache[track_id] = int(team)
-
-    def assign(self, frame_idx: int, crops: list[np.ndarray], track_ids: list[int]) -> list[int | None]:
-        if not self._fitted and not self._gave_up and len(self._buffer_crop_by_track) < self.max_fit_crops:
-            for crop, track_id in zip(crops, track_ids):
-                self._buffer_crop_by_track.setdefault(track_id, crop)
-        self._maybe_fit(frame_idx)
-
+    def assign(self, crops: list[np.ndarray], track_ids: list[int]) -> list[int | None]:
         teams: list[int | None] = []
-        uncached_crops, uncached_track_ids = [], []
-        for crop, track_id in zip(crops, track_ids):
+        pending_crops, pending_track_ids, pending_idx = [], [], []
+        for i, (crop, track_id) in enumerate(zip(crops, track_ids)):
             if track_id in self._team_cache:
                 teams.append(self._team_cache[track_id])
-            elif self._fitted:
-                uncached_crops.append(crop)
-                uncached_track_ids.append(track_id)
-                teams.append(None)  # placeholder, filled in below
             else:
-                teams.append(None)
+                teams.append(None)  # placeholder, filled in below
+                pending_crops.append(crop)
+                pending_track_ids.append(track_id)
+                pending_idx.append(i)
 
-        if uncached_crops:
-            predictions = self.classifier.predict(uncached_crops)
-            pred_by_track = dict(zip(uncached_track_ids, (int(p) for p in predictions)))
-            for i, track_id in enumerate(track_ids):
-                if track_id in pred_by_track:
-                    self._team_cache[track_id] = pred_by_track[track_id]
-                    teams[i] = pred_by_track[track_id]
+        if pending_crops:
+            predictions = self.classifier.predict(pending_crops)
+            for i, track_id, team in zip(pending_idx, pending_track_ids, predictions):
+                teams[i] = self._record_vote(track_id, team)
 
         return teams
 
@@ -134,16 +109,20 @@ def run(config_path: str):
     tracker = Tracker.from_config(config)
 
     team_cfg = config.get("team_classification", {})
-    team_assigner = (
-        TeamAssigner(
-            device=config.get("device", "mps"),
-            min_distinct_tracks=team_cfg.get("min_distinct_tracks", 10),
-            max_wait_frames=team_cfg.get("max_wait_frames", 500),
-            max_fit_crops=team_cfg.get("max_fit_crops", 60),
-        )
-        if team_cfg.get("enabled", True)
-        else None
-    )
+    team_assigner = None
+    if team_cfg.get("enabled", True):
+        anchor_paths = team_cfg.get("anchors", {})
+        if 0 not in anchor_paths or 1 not in anchor_paths:
+            raise ValueError(
+                "team_classification.anchors needs at least a '0' and '1' entry "
+                "(one example player crop per team, from the calibration step)"
+            )
+        anchor_crops = {label: cv2.imread(path) for label, path in anchor_paths.items()}
+        # YAML can't have a None key; the referee/other anchor is keyed "referee" in
+        # config but None everywhere else (matching the position log's team=None).
+        if "referee" in anchor_crops:
+            anchor_crops[None] = anchor_crops.pop("referee")
+        team_assigner = TeamAssigner(anchor_crops)
 
     ball_track_cfg = config.get("ball_tracking", {})
     ball_tracker = (
@@ -184,7 +163,7 @@ def run(config_path: str):
             person_idx = np.where(is_person)[0]
             crops = [crop_torso(frame, detections.xyxy[i]) for i in person_idx]
             track_ids = [int(detections.tracker_id[i]) for i in person_idx]
-            person_teams = team_assigner.assign(frame_idx, crops, track_ids)
+            person_teams = team_assigner.assign(crops, track_ids)
             for i, team in zip(person_idx, person_teams):
                 teams[i] = team
 

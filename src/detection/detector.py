@@ -39,6 +39,7 @@ class Detector:
         ball_confidence_threshold: float = FALLBACK_BALL_CONFIDENCE_THRESHOLD,
         class_name_overrides: dict[int, str] | None = None,
         singleton_class_ids: list[int] | None = None,
+        ball_class_id: int | None = None,
     ):
         self.model = YOLO(model_path)
         self.device = device
@@ -46,6 +47,13 @@ class Detector:
         self.iou_threshold = iou_threshold
         self.classes = classes
         self.ball_confidence_threshold = ball_confidence_threshold
+        # In custom mode, the ball is a much smaller/faster/blurrier target
+        # than a full-body player or ref box and needs its own, much lower
+        # confidence threshold, the same way fallback mode already always
+        # has (see the two-pass split below) — without this, ball detections
+        # get held to the same bar as person-sized boxes and a lot of real,
+        # lower-confidence ball hits get silently dropped.
+        self.ball_class_id = ball_class_id
         self._is_fallback = classes is None
         # Classes that can only ever have exactly one true instance in frame
         # (there's one ball in play) — keep only the top-confidence detection
@@ -85,7 +93,15 @@ class Detector:
 
     def detect(self, frame: np.ndarray) -> sv.Detections:
         if not self._is_fallback:
-            return self._dedup_singletons(self._infer(frame, self.classes, self.confidence_threshold))
+            if self.ball_class_id is not None and self.ball_class_id in self.classes:
+                other_classes = [c for c in self.classes if c != self.ball_class_id]
+                passes = [self._infer(frame, [self.ball_class_id], self.ball_confidence_threshold)]
+                if other_classes:
+                    passes.append(self._infer(frame, other_classes, self.confidence_threshold))
+                detections = sv.Detections.merge(passes)
+            else:
+                detections = self._infer(frame, self.classes, self.confidence_threshold)
+            return self._dedup_singletons(detections)
 
         people = self._infer(frame, [COCO_PERSON_CLASS_ID], self.confidence_threshold)
         ball = self._infer(frame, [COCO_SPORTS_BALL_CLASS_ID], self.ball_confidence_threshold)
@@ -110,4 +126,5 @@ class Detector:
             ball_confidence_threshold=det_cfg.get("ball_confidence_threshold", FALLBACK_BALL_CONFIDENCE_THRESHOLD),
             class_name_overrides=det_cfg.get("class_name_overrides"),
             singleton_class_ids=det_cfg.get("singleton_class_ids"),
+            ball_class_id=det_cfg.get("ball_class_id"),
         )
